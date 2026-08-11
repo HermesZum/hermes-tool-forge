@@ -36,11 +36,26 @@ _ALLOWED_MODULES = frozenset({
     "copy", "pprint", "calendar", "difflib",
 })
 
-# Forbidden builtins — stripped from the exec namespace
+# Forbidden builtins — stripped from the exec namespace AND blocked by AST
 _FORBIDDEN_BUILTINS = frozenset({
     "__import__", "open", "exec", "eval", "compile", "globals",
     "locals", "vars", "dir", "type", "input", "breakpoint",
     "getattr", "setattr", "delattr", "hasattr",
+})
+
+# Forbidden call names — caught by AST static analysis
+_FORBIDDEN_CALL_NAMES = frozenset({
+    "__import__", "open", "exec", "eval", "compile",
+    "globals", "locals", "vars", "input", "breakpoint",
+})
+
+# Runtime-stripped builtins — deleted from the subprocess before user code runs.
+# Subset of _FORBIDDEN_BUILTINS that are truly dangerous at runtime.
+# NOTE: getattr/setattr/delattr/hasattr are NOT stripped at runtime because
+# the stripping code itself needs delattr. They ARE caught by AST analysis.
+_RUNTIME_STRIPPED = frozenset({
+    "__import__", "open", "exec", "eval", "compile",
+    "globals", "locals", "vars", "input", "breakpoint",
 })
 
 # Maximum code size (chars)
@@ -103,13 +118,13 @@ def validate_code(code: str) -> Tuple[bool, str]:
                 if alias.name == "*":
                     issues.append("Wildcard import not allowed")
 
-        # Catch __import__() calls — the bypass vector
+        # Catch calls to forbidden builtin functions
         elif isinstance(node, ast.Call):
             func = node.func
-            # Direct __import__('module') call
-            if isinstance(func, ast.Name) and func.id == "__import__":
-                issues.append("Forbidden: __import__() call")
-            # getattr(__import__, ...) or similar
+            # Direct calls to dangerous builtins
+            if isinstance(func, ast.Name) and func.id in _FORBIDDEN_CALL_NAMES:
+                issues.append(f"Forbidden: {func.id}() call")
+            # getattr/setattr/delattr can bypass import restrictions
             elif isinstance(func, ast.Name) and func.id in ("getattr", "setattr", "delattr"):
                 issues.append(f"Forbidden: {func.id}() can bypass import restrictions")
 
@@ -121,53 +136,15 @@ def validate_code(code: str) -> Tuple[bool, str]:
                                  "modules", "path", "environ"):
                     issues.append(f"Forbidden: {node.value.id}.{node.attr}")
 
+        # Catch subscript access to __builtins__ or globals() — bypass vector
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in ("__builtins__", "globals", "vars"):
+                issues.append(f"Forbidden: subscript on {node.value.id} — bypass vector")
+
     if issues:
         return False, "; ".join(issues[:5])  # Limit to first 5 issues
 
     return True, "OK"
-
-
-def _build_harness(code: str, call_args_json: str) -> str:
-    """Build the Python harness script for subprocess execution.
-
-    The harness:
-    1. Sets resource limits
-    2. Replaces builtins with a restricted set
-    3. Defines the user's execute() function
-    4. Reads args from stdin
-    5. Calls execute() and prints the JSON result
-    """
-    return (
-        "import json, sys, traceback, resource\n"
-        "\n"
-        "# Set resource limits\n"
-        f"resource.setrlimit(resource.RLIMIT_CPU, ({_RLIMIT_CPU}, {_RLIMIT_CPU}))\n"
-        f"resource.setrlimit(resource.RLIMIT_FSIZE, ({_RLIMIT_FSIZE}, {_RLIMIT_FSIZE}))\n"
-        f"resource.setrlimit(resource.RLIMIT_AS, ({_RLIMIT_AS}, {_RLIMIT_AS}))\n"
-        "try:\n"
-        "    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n"
-        "except (ValueError, OSError):\n"
-        "    pass  # NPROC not available on all platforms\n"
-        "\n"
-        "# Restricted builtins — strip dangerous functions\n"
-        "_safe_builtins = {k: v for k, v in __builtins__.__dict__.items()\n"
-        "                  if k not in __import__('sandbox_forbidden')._FORBIDDEN_BUILTINS}\n"
-        "del _safe_builtins['__import__']\n"
-        "\n"
-        + code +
-        "\n\n"
-        "# Read args and execute\n"
-        "test_args = json.loads(sys.stdin.read())\n"
-        "if 'execute' not in dir():\n"
-        "    print(json.dumps({'error': 'No execute() function defined'}))\n"
-        "    sys.exit(1)\n"
-        "try:\n"
-        "    result = execute(test_args)\n"
-        "    print(json.dumps(result, default=str))\n"
-        "except Exception as e:\n"
-        "    print(json.dumps({'error': str(e), 'traceback': traceback.format_exc()}))\n"
-        "    sys.exit(1)\n"
-    )
 
 
 def run_code(
@@ -196,7 +173,9 @@ def run_code(
     if len(args_json) > MAX_TEST_ARGS_SIZE:
         return False, "", f"Arguments exceed {MAX_TEST_ARGS_SIZE} chars"
 
-    # Build the harness — user code at module level
+    # Build the harness — user code at module level with restricted builtins
+    _forbidden_list = ",".join(repr(b) for b in sorted(_RUNTIME_STRIPPED))
+    _allowed_list = ",".join(repr(m) for m in sorted(_ALLOWED_MODULES))
     harness = (
         "import json, sys, traceback, resource\n"
         "\n"
@@ -208,6 +187,30 @@ def run_code(
         "    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n"
         "except (ValueError, OSError):\n"
         "    pass\n"
+        "\n"
+        "# Replace __import__ with a restricted version BEFORE stripping it\n"
+        f"_allowed = frozenset([{_allowed_list}])\n"
+        "_orig_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __builtins__['__import__']\n"
+        "def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    root = name.split('.')[0]\n"
+        "    if root not in _allowed:\n"
+        "        raise ImportError(f\"Module '{{root}}' not in allowlist\")\n"
+        "    return _orig_import(name, globals, locals, fromlist, level)\n"
+        "if isinstance(__builtins__, dict):\n"
+        "    __builtins__['__import__'] = _safe_import\n"
+        "else:\n"
+        "    __builtins__.__import__ = _safe_import\n"
+        "\n"
+        "# Strip other dangerous builtins (but keep our safe __import__)\n"
+        f"_forbidden = frozenset([{_forbidden_list}]) - frozenset(['__import__'])\n"
+        "for _name in _forbidden:\n"
+        "    try:\n"
+        "        delattr(__builtins__, _name)\n"
+        "    except (AttributeError, TypeError):\n"
+        "        try:\n"
+        "            __builtins__.pop(_name, None)\n"
+        "        except (AttributeError, TypeError):\n"
+        "            pass\n"
         "\n"
         + code +
         "\n\n"

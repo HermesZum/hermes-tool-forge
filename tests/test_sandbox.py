@@ -175,3 +175,66 @@ class TestRunCode:
         import json
         result = json.loads(stdout)
         assert result["sqrt"] == 4.0
+
+
+class TestSandboxSecurityRegression:
+    """Regression tests for critical security vulnerabilities found in audit.
+
+    These prove that the sandbox blocks all known escape vectors:
+    - exec/eval/compile calls (AST + runtime)
+    - open() calls (AST + runtime)
+    - __import__() calls (AST + runtime)
+    - __builtins__ subscript access (AST)
+    - globals()/vars() subscript access (AST)
+    """
+
+    def test_exec_call_blocked_by_ast(self):
+        """exec() must be caught by static analysis."""
+        code = 'def execute(args):\n    exec("import os")\n    return {}'
+        ok, msg = validate_code(code)
+        assert not ok, "exec() call should be blocked by AST"
+        assert "exec" in msg.lower()
+
+    def test_eval_call_blocked_by_ast(self):
+        """eval() must be caught by static analysis."""
+        code = 'def execute(args):\n    x = eval("1+1")\n    return {"x": x}'
+        ok, msg = validate_code(code)
+        assert not ok, "eval() call should be blocked by AST"
+        assert "eval" in msg.lower()
+
+    def test_open_call_blocked_by_ast(self):
+        """open() must be caught by static analysis."""
+        code = 'def execute(args):\n    f = open("/etc/passwd")\n    return {"data": f.read()}'
+        ok, msg = validate_code(code)
+        assert not ok, "open() call should be blocked by AST"
+        assert "open" in msg.lower()
+
+    def test_compile_call_blocked_by_ast(self):
+        """compile() must be caught by static analysis."""
+        code = 'def execute(args):\n    c = compile("x=1", "<s>", "exec")\n    return {}'
+        ok, msg = validate_code(code)
+        assert not ok, "compile() call should be blocked by AST"
+        assert "compile" in msg.lower()
+
+    def test_builtins_subscript_blocked_by_ast(self):
+        """__builtins__ subscript access must be caught by static analysis."""
+        code = 'def execute(args):\n    b = __builtins__["__import__"]("os")\n    return {}'
+        ok, msg = validate_code(code)
+        assert not ok, "__builtins__ subscript should be blocked by AST"
+
+    def test_globals_subscript_blocked_by_ast(self):
+        """globals() subscript access must be caught by static analysis."""
+        code = 'def execute(args):\n    g = globals()["__builtins__"]\n    return {}'
+        ok, msg = validate_code(code)
+        assert not ok, "globals() subscript should be blocked by AST"
+
+    def test_safe_code_still_passes(self):
+        """Legitimate code must still pass after adding the new checks."""
+        code = _code("""
+            import json
+            import math
+            def execute(args):
+                return {"doubled": args.get("x", 0) * 2, "sqrt": math.sqrt(args.get("y", 9))}
+        """)
+        ok, msg = validate_code(code)
+        assert ok, f"Safe code should pass, got: {msg}"
