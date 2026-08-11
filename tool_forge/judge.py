@@ -85,14 +85,14 @@ def judge_code(
             "method": "static",
         }
 
-    # If no LLM available, conditional approval based on static analysis only
+    # If no LLM available, FAIL CLOSED — do not approve without judge review
     if llm is None:
         return {
-            "approved": True,
-            "confidence": 0.5,
-            "risks": [],
-            "recommendations": ["Static analysis passed; LLM judge unavailable"],
-            "summary": "Conditionally approved (static only, no LLM judge)",
+            "approved": False,
+            "confidence": 0.0,
+            "risks": ["LLM judge unavailable — cannot review code safety"],
+            "recommendations": ["Provide LLM access to the plugin or review code manually"],
+            "summary": "Rejected (no LLM judge available — fail-closed)",
             "method": "static_only",
         }
 
@@ -107,13 +107,13 @@ def judge_code(
 
         response = _call_llm(llm, user_prompt)
         if response is None:
-            # LLM call failed — fall back to static-only
+            # LLM call failed — FAIL CLOSED
             return {
-                "approved": True,
-                "confidence": 0.5,
-                "risks": [],
-                "recommendations": ["LLM judge call failed; static analysis only"],
-                "summary": "Conditionally approved (LLM judge unavailable)",
+                "approved": False,
+                "confidence": 0.0,
+                "risks": ["LLM judge call returned no response"],
+                "recommendations": ["Check LLM configuration and retry"],
+                "summary": "Rejected (LLM judge call failed — fail-closed)",
                 "method": "static_fallback",
             }
 
@@ -123,12 +123,13 @@ def judge_code(
 
     except Exception as e:
         logger.error("forge-judge: LLM review failed: %s", e, exc_info=True)
+        # FAIL CLOSED on any exception
         return {
-            "approved": True,
-            "confidence": 0.4,
+            "approved": False,
+            "confidence": 0.0,
             "risks": [f"LLM judge error: {e}"],
-            "recommendations": ["Review manually before use"],
-            "summary": f"Conditionally approved (judge error: {e})",
+            "recommendations": ["Check LLM access and retry, or review manually"],
+            "summary": f"Rejected (judge error: {e} — fail-closed)",
             "method": "error_fallback",
         }
 

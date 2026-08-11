@@ -48,7 +48,7 @@ def register(ctx) -> None:
         llm = ctx.llm
     except Exception:
         llm = None
-        logger.warning("tool-forge: LLM facade unavailable, judge will use static-only mode")
+        logger.warning("tool-forge: LLM facade unavailable — judge will fail-closed (reject all)")
 
     # Create the handler
     handler = ForgeHandler(

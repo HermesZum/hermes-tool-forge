@@ -1,20 +1,23 @@
 """Forge tool handler — the main tool the LLM calls to create new tools.
 
 Exposes the ``forge_tool`` agent tool which:
-1. Validates the generated code (static analysis)
-2. Runs the LLM judge for safety review
+1. Validates the generated code (static analysis with import allowlist)
+2. Runs the LLM judge for safety review (fail-closed if LLM unavailable)
 3. Tests the code in a sandbox subprocess
-4. Registers the tool in the Hermes registry if approved + tested
-5. Persists the tool definition for future sessions
+4. Persists the tool definition for future sessions
 
-The forged tool is registered in the registry under the ``forged`` toolset.
-It does NOT appear in the system prompt (preserving prompt caching).
-The agent can call it via ``execute_code`` RPC, or the ``forge_call`` tool
-which dispatches to the registered handler directly.
+Forged tools ALWAYS run in the sandbox subprocess — never in the main
+Hermes process. This is enforced by using run_code() for both testing
+and normal forge_call invocations.
+
+The agent calls forged tools via forge_call, which re-runs the code in
+the sandbox with the provided arguments.
 """
 
 import json
 import logging
+import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -26,6 +29,9 @@ from .store import ForgeStore
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Tool name validation — snake_case, 1-64 chars, starts with letter
+_TOOL_NAME_RE = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
 
 # Default test arguments for sandbox testing
 _DEFAULT_TEST_ARGS = {"test": True}
@@ -46,7 +52,7 @@ FORGE_TOOL_SCHEMA = {
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Unique tool name (snake_case, no spaces)",
+                "description": "Unique tool name (snake_case, no spaces, 1-64 chars)",
             },
             "description": {
                 "type": "string",
@@ -64,7 +70,8 @@ FORGE_TOOL_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Python code defining execute(args: dict) -> dict. "
-                    "Only stdlib modules for data processing. "
+                    "Only stdlib modules from the allowlist: json, math, re, "
+                    "collections, datetime, itertools, functools, etc. "
                     "No network, no filesystem writes, no subprocess."
                 ),
             },
@@ -77,7 +84,6 @@ FORGE_TOOL_SCHEMA = {
     },
 }
 
-# Forge call schema — call a previously forged tool
 FORGE_CALL_SCHEMA = {
     "name": "forge_call",
     "description": (
@@ -100,17 +106,12 @@ FORGE_CALL_SCHEMA = {
     },
 }
 
-# Forge list schema — list all forged tools
 FORGE_LIST_SCHEMA = {
     "name": "forge_list",
     "description": "List all forged tools with their status and usage stats.",
-    "parameters": {
-        "type": "object",
-        "properties": {},
-    },
+    "parameters": {"type": "object", "properties": {}},
 }
 
-# Forge promote schema — promote a tool to a skill
 FORGE_PROMOTE_SCHEMA = {
     "name": "forge_promote",
     "description": (
@@ -138,7 +139,11 @@ ALL_TOOL_SCHEMAS = [
 
 
 class ForgeHandler:
-    """Manages the forge tool lifecycle — create, judge, test, register, call."""
+    """Manages the forge tool lifecycle — create, judge, test, call, promote.
+
+    Forged tools are NEVER exec'd in the main process. Their code is stored
+    in SQLite and re-run in the sandbox subprocess on every forge_call.
+    """
 
     def __init__(
         self,
@@ -151,8 +156,7 @@ class ForgeHandler:
         self._llm = llm
         self._skills_dir = skills_dir
         self._session_id = session_id
-        # Registered handlers for forged tools (name -> callable)
-        self._handlers: Dict[str, callable] = {}
+        self._lock = threading.RLock()
 
     def handle(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Dispatch a forge_* tool call."""
@@ -172,44 +176,76 @@ class ForgeHandler:
             return json.dumps({"error": str(e)})
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return schemas for all forge tools."""
         return ALL_TOOL_SCHEMAS
 
+    def _validate_name(self, name: str) -> Optional[str]:
+        """Validate a tool name. Returns None if OK, error message if invalid."""
+        if not name:
+            return "name is required"
+        if not _TOOL_NAME_RE.match(name):
+            return ("name must be snake_case: 1-64 chars, lowercase letters, "
+                    "digits, and underscores only, starting with a letter")
+        return None
+
     def _handle_forge(self, args: Dict[str, Any]) -> str:
-        """Create, judge, test, and register a new forged tool."""
+        """Create, judge, test, and persist a new forged tool."""
         name = args.get("name", "").strip()
         description = args.get("description", "").strip()
         params_schema = args.get("params_schema", {})
         python_code = args.get("python_code", "").strip()
         test_args = args.get("test_args", _DEFAULT_TEST_ARGS)
 
-        # Validate inputs
-        if not name or not description or not python_code:
+        # Validate name
+        name_err = self._validate_name(name)
+        if name_err:
+            return json.dumps({"error": name_err})
+
+        if not description or not python_code:
             return json.dumps({
-                "error": "name, description, and python_code are required",
+                "error": "description and python_code are required",
             })
 
         if not isinstance(params_schema, dict):
             return json.dumps({"error": "params_schema must be a JSON object"})
 
-        # Check for name collision with existing forged tool
-        existing = self._store.get_by_name(name)
-        if existing:
+        # Validate params_schema has required structure
+        if params_schema.get("type") != "object":
             return json.dumps({
-                "error": f"A forged tool named '{name}' already exists. "
-                         f"Use a different name or delete the old one first.",
-                "existing_tool": {
-                    "id": existing["id"],
-                    "approved": existing.get("judge_approved", False),
-                    "tested": existing.get("test_passed", False),
-                },
+                "error": "params_schema must have 'type': 'object'",
             })
+
+        # Check for name collision
+        with self._lock:
+            existing = self._store.get_by_name(name)
+            if existing:
+                return json.dumps({
+                    "error": f"A forged tool named '{name}' already exists. "
+                             f"Use a different name or delete the old one first.",
+                    "existing_tool": {
+                        "id": existing["id"],
+                        "approved": existing.get("judge_approved", False),
+                        "tested": existing.get("test_passed", False),
+                    },
+                })
 
         tool_id = uuid.uuid4().hex[:12]
 
         # Step 1: Static validation
         static_ok, static_msg = validate_code(python_code)
         if not static_ok:
+            # Store the rejected tool for audit trail
+            self._store.add({
+                "id": tool_id,
+                "name": name,
+                "description": description,
+                "params_schema": params_schema,
+                "python_code": python_code,
+                "judge_verdict": json.dumps({"static": static_msg}),
+                "judge_approved": False,
+                "test_passed": False,
+                "created_at": time.time(),
+                "session_id": self._session_id,
+            })
             return json.dumps({
                 "tool_id": tool_id,
                 "status": "rejected",
@@ -217,11 +253,10 @@ class ForgeHandler:
                 "reason": static_msg,
             })
 
-        # Step 2: LLM judge
+        # Step 2: LLM judge (fail-closed if unavailable)
         verdict = judge_code(python_code, description, params_schema, self._llm)
 
         if not verdict["approved"]:
-            # Store the rejected tool for audit trail
             self._store.add({
                 "id": tool_id,
                 "name": name,
@@ -267,32 +302,21 @@ class ForgeHandler:
                 "judge_verdict": verdict,
             })
 
-        # Step 4: Register the handler
-        handler = self._build_handler(python_code, tool_id)
-        if handler is None:
-            return json.dumps({
-                "tool_id": tool_id,
-                "status": "registration_failed",
-                "stage": "handler_build",
-                "reason": "Failed to compile execute() from generated code",
+        # Step 4: Persist (no exec in main process — code runs in sandbox)
+        with self._lock:
+            self._store.add({
+                "id": tool_id,
+                "name": name,
+                "description": description,
+                "params_schema": params_schema,
+                "python_code": python_code,
+                "judge_verdict": json.dumps(verdict),
+                "judge_approved": True,
+                "test_passed": True,
+                "test_output": stdout[:500],
+                "created_at": time.time(),
+                "session_id": self._session_id,
             })
-
-        self._handlers[name] = handler
-
-        # Step 5: Persist
-        self._store.add({
-            "id": tool_id,
-            "name": name,
-            "description": description,
-            "params_schema": params_schema,
-            "python_code": python_code,
-            "judge_verdict": json.dumps(verdict),
-            "judge_approved": True,
-            "test_passed": True,
-            "test_output": stdout[:500],
-            "created_at": time.time(),
-            "session_id": self._session_id,
-        })
 
         logger.info("forge: tool '%s' forged successfully (id=%s)", name, tool_id)
 
@@ -310,59 +334,72 @@ class ForgeHandler:
         })
 
     def _handle_call(self, args: Dict[str, Any]) -> str:
-        """Call a previously forged tool."""
+        """Call a previously forged tool — runs in sandbox subprocess."""
         tool_name = args.get("tool_name", "").strip()
         call_args = args.get("args", {})
 
         if not tool_name:
             return json.dumps({"error": "tool_name is required"})
 
-        # Check if handler is loaded
-        if tool_name not in self._handlers:
-            # Try to load from store
+        name_err = self._validate_name(tool_name)
+        if name_err:
+            return json.dumps({"error": f"Invalid tool name: {name_err}"})
+
+        with self._lock:
             tool = self._store.get_by_name(tool_name)
-            if tool is None:
-                return json.dumps({
-                    "error": f"No forged tool named '{tool_name}'. "
-                             f"Use forge_list to see available tools.",
-                })
 
-            if not tool.get("judge_approved") or not tool.get("test_passed"):
-                return json.dumps({
-                    "error": f"Tool '{tool_name}' was not approved or tested.",
-                })
+        if tool is None:
+            return json.dumps({
+                "error": f"No forged tool named '{tool_name}'. "
+                         f"Use forge_list to see available tools.",
+            })
 
-            handler = self._build_handler(tool["python_code"], tool["id"])
-            if handler is None:
-                return json.dumps({
-                    "error": f"Could not load tool '{tool_name}' — "
-                             f"its code may be corrupted.",
-                })
-            self._handlers[tool_name] = handler
+        if not tool.get("judge_approved") or not tool.get("test_passed"):
+            return json.dumps({
+                "error": f"Tool '{tool_name}' was not approved or tested.",
+            })
 
-        # Call the handler
-        handler = self._handlers[tool_name]
+        # Re-validate stored code before execution (safety: DB could be tampered)
+        code = tool["python_code"]
+        ok, msg = validate_code(code)
+        if not ok:
+            logger.error("forge: stored code for '%s' failed re-validation: %s",
+                         tool_name, msg)
+            return json.dumps({
+                "error": f"Stored code for '{tool_name}' failed safety validation: {msg}",
+            })
+
+        # Run in sandbox — NEVER in the main process
+        passed, stdout, stderr = run_code(code, call_args)
+
+        if not passed:
+            return json.dumps({
+                "error": f"Tool execution failed: {stderr or stdout}",
+            })
+
+        # Update use count
+        with self._lock:
+            self._store.increment_use(tool["id"])
+            # Check auto-promotion
+            updated = self._store.get_by_name(tool_name)
+            if updated and should_auto_promote(updated):
+                path = promote_to_skill(updated, self._skills_dir)
+                if path:
+                    self._store.update(tool["id"], promoted=True, promoted_path=path)
+                    logger.info("forge: auto-promoted '%s' to %s", tool_name, path)
+
+        # Parse the sandbox output — it's the JSON result from execute()
         try:
-            result = handler(call_args)
-            # Update use count
-            tool = self._store.get_by_name(tool_name)
-            if tool:
-                self._store.increment_use(tool["id"])
-                # Check auto-promotion
-                if should_auto_promote(tool):
-                    path = promote_to_skill(tool, self._skills_dir)
-                    if path:
-                        self._store.update(tool["id"], promoted=True, promoted_path=path)
-                        logger.info(
-                            "forge: auto-promoted '%s' to %s", tool_name, path
-                        )
-            return json.dumps({"result": result}, default=str)
-        except Exception as e:
-            return json.dumps({"error": f"Tool execution failed: {e}"})
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            result = {"raw_output": stdout}
+
+        return json.dumps({"result": result}, default=str)
 
     def _handle_list(self, args: Dict[str, Any]) -> str:
         """List all forged tools."""
-        tools = self._store.list_all()
+        with self._lock:
+            tools = self._store.list_all()
         if not tools:
             return json.dumps({"tools": [], "total": 0, "message": "No forged tools yet."})
 
@@ -389,7 +426,13 @@ class ForgeHandler:
         if not tool_name:
             return json.dumps({"error": "tool_name is required"})
 
-        tool = self._store.get_by_name(tool_name)
+        name_err = self._validate_name(tool_name)
+        if name_err:
+            return json.dumps({"error": f"Invalid tool name: {name_err}"})
+
+        with self._lock:
+            tool = self._store.get_by_name(tool_name)
+
         if tool is None:
             return json.dumps({"error": f"No forged tool named '{tool_name}'"})
 
@@ -408,7 +451,8 @@ class ForgeHandler:
         if path is None:
             return json.dumps({"error": "Promotion failed — check logs"})
 
-        self._store.update(tool["id"], promoted=True, promoted_path=path)
+        with self._lock:
+            self._store.update(tool["id"], promoted=True, promoted_path=path)
         return json.dumps({
             "status": "promoted",
             "tool_name": tool_name,
@@ -419,35 +463,24 @@ class ForgeHandler:
             ),
         })
 
-    def _build_handler(self, python_code: str, tool_id: str) -> Optional[callable]:
-        """Build a callable handler from the forged Python code.
-
-        The code must define an execute(args: dict) -> dict function.
-        We exec it in a restricted namespace and return the execute callable.
-        """
-        try:
-            namespace: Dict[str, Any] = {"__builtins__": __builtins__}
-            exec(python_code, namespace)
-            execute_fn = namespace.get("execute")
-            if not callable(execute_fn):
-                return None
-            return execute_fn
-        except Exception as e:
-            logger.error("forge: failed to build handler for %s: %s", tool_id, e)
-            return None
-
     def reload_from_store(self) -> int:
-        """Load all approved+tested forged tools from the store.
+        """Verify all approved+tested forged tools from the store.
 
-        Called at plugin initialization to restore forged tools from
-        previous sessions. Returns the number of tools loaded.
+        This does NOT load handlers (no exec). It just counts available
+        tools so the agent knows what's available via forge_call.
         """
-        tools = self._store.list_approved()
+        with self._lock:
+            tools = self._store.list_approved()
         count = 0
         for tool in tools:
-            handler = self._build_handler(tool["python_code"], tool["id"])
-            if handler is not None:
-                self._handlers[tool["name"]] = handler
+            # Re-validate stored code
+            ok, _ = validate_code(tool["python_code"])
+            if ok:
                 count += 1
-                logger.info("forge: reloaded '%s' from store", tool["name"])
+                logger.info("forge: verified '%s' from store", tool["name"])
+            else:
+                logger.warning(
+                    "forge: stored code for '%s' failed validation — skipped",
+                    tool["name"],
+                )
         return count

@@ -11,7 +11,7 @@ from tool_forge.judge import judge_code, _parse_verdict, _normalize_verdict
 
 
 class TestJudgeCode:
-    """Judge review of forged tool code."""
+    """Judge review of forged tool code — fail-closed when LLM unavailable."""
 
     def test_static_rejection_forbidden_import(self):
         code = "import socket\ndef execute(args):\n    return {}"
@@ -26,19 +26,21 @@ class TestJudgeCode:
         assert not verdict["approved"]
         assert "Syntax" in verdict["risks"][0]
 
-    def test_static_only_approval_no_llm(self):
+    def test_no_llm_fail_closed(self):
+        """When LLM is unavailable, the judge must REJECT, not approve."""
         code = "def execute(args):\n    return {'result': args.get('x', 0) * 2}"
         verdict = judge_code(code, "Doubler", {"type": "object"}, llm=None)
-        assert verdict["approved"]
-        assert verdict["confidence"] == 0.5
+        assert not verdict["approved"]
+        assert verdict["confidence"] == 0.0
         assert verdict["method"] == "static_only"
+        assert "unavailable" in verdict["summary"].lower() or "available" in verdict["summary"].lower()
 
-    def test_llm_unavailable_fallback(self):
+    def test_llm_unavailable_fallback_rejects(self):
+        """When LLM call fails, the judge must REJECT (fail-closed)."""
         code = "def execute(args):\n    return {}"
-        # Pass an object that has no chat/complete methods
+        # Pass an object that has no chat/complete methods — _call_llm returns None
         verdict = judge_code(code, "Empty tool", {}, llm=object())
-        # Should fall back to static-only since the LLM call fails
-        assert verdict["approved"]
+        assert not verdict["approved"]
         assert verdict["method"] in ("static_fallback", "error_fallback", "static_only")
 
 

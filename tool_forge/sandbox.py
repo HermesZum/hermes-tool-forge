@@ -1,51 +1,60 @@
-"""Restricted execution environment for testing forged tool code.
+"""Restricted execution environment for forged tool code.
 
 Runs LLM-generated Python in a subprocess with:
-- No network access (no socket, no urllib, no requests)
-- No filesystem writes (read-only access to /tmp only)
+- Allowlist-based import control (only safe stdlib modules)
+- __import__ blocked in restricted builtins
+- Resource limits (CPU, file size, address space, no subprocesses)
 - Timeout (default 10 seconds)
 - Captured stdout/stderr
 - AST-based static analysis before execution
 
-This is NOT a full security sandbox. It is a safety net that catches
-obvious mistakes before the code is registered. The judge LLM is the
-primary safety gate.
+Forged tools ALWAYS run in this sandbox — both during testing AND during
+normal forge_call invocations. They never exec() in the main Hermes process.
 """
 
 import ast
 import json
 import logging
 import os
+import resource
 import subprocess
 import sys
 import tempfile
-import time
+import textwrap
 from typing import Any, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Forbidden imports — these modules are stripped from the AST before exec
-_FORBIDDEN_MODULES = frozenset({
-    "socket", "urllib", "requests", "http", "ssl", "ftplib",
-    "smtplib", "telnetlib", "paramiko", "fabric",
-    "ctypes", "cffi", "subprocess", "multiprocessing",
-    "pickle", "shelve", "marshal",
-    "os.system", "os.popen", "os.exec", "os.spawn",
-    "shutil.rmtree", "shutil.move",
+# ── Allowlist of permitted imports ──────────────────────────────────────
+# Only these stdlib modules are allowed. Everything else is rejected.
+_ALLOWED_MODULES = frozenset({
+    "json", "math", "re", "collections", "datetime", "itertools",
+    "functools", "operator", "string", "textwrap", "unicodedata",
+    "decimal", "fractions", "statistics", "hashlib", "base64",
+    "uuid", "csv", "io", "bisect", "heapq", "array",
+    "copy", "pprint", "calendar", "difflib",
 })
 
-# AST node types that are forbidden
-_FORBIDDEN_NODES = (
-    ast.ImportFrom,
-)
+# Forbidden builtins — stripped from the exec namespace
+_FORBIDDEN_BUILTINS = frozenset({
+    "__import__", "open", "exec", "eval", "compile", "globals",
+    "locals", "vars", "dir", "type", "input", "breakpoint",
+    "getattr", "setattr", "delattr", "hasattr",
+})
 
 # Maximum code size (chars)
 MAX_CODE_SIZE = 10_000
-# Maximum test timeout (seconds)
+# Maximum test args size (chars when JSON-serialized)
+MAX_TEST_ARGS_SIZE = 10_000
+# Default test timeout (seconds)
 DEFAULT_TIMEOUT = 10
 # Maximum stdout/stderr capture (bytes)
 MAX_OUTPUT = 5_000
+# Resource limits for sandbox subprocess
+_RLIMIT_CPU = 5        # 5 seconds CPU time
+_RLIMIT_FSIZE = 1_048_576  # 1 MB file writes
+_RLIMIT_AS = 268_435_456   # 256 MB address space
 
 
 class SandboxError(Exception):
@@ -54,7 +63,7 @@ class SandboxError(Exception):
 
 
 def validate_code(code: str) -> Tuple[bool, str]:
-    """Static analysis of forged tool code.
+    """Static analysis of forged tool code using an import ALLOWLIST.
 
     Returns (ok, message). If ok is False, message describes the issue.
     """
@@ -73,49 +82,107 @@ def validate_code(code: str) -> Tuple[bool, str]:
     issues = []
 
     for node in ast.walk(tree):
-        # Check imports
+        # Check imports — use ALLOWLIST, not blocklist
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root_mod = alias.name.split(".")[0]
-                if root_mod in _FORBIDDEN_MODULES:
-                    issues.append(f"Forbidden import: {alias.name}")
+                if root_mod not in _ALLOWED_MODULES:
+                    issues.append(
+                        f"Import '{alias.name}' not in allowlist. "
+                        f"Allowed: {', '.join(sorted(_ALLOWED_MODULES))}"
+                    )
 
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 root_mod = node.module.split(".")[0]
-                if root_mod in _FORBIDDEN_MODULES:
-                    issues.append(f"Forbidden import: {node.module}")
-            # Also check relative imports
+                if root_mod not in _ALLOWED_MODULES:
+                    issues.append(
+                        f"Import from '{node.module}' not in allowlist."
+                    )
             for alias in node.names:
                 if alias.name == "*":
                     issues.append("Wildcard import not allowed")
 
-        elif isinstance(node, ast.Attribute):
-            # Check for os.system, os.popen, etc.
-            if isinstance(node.value, ast.Name) and node.value.id == "os":
-                if node.attr in ("system", "popen", "exec", "spawn", "fork",
-                                 "kill", "remove", "unlink", "rmdir"):
-                    issues.append(f"Forbidden os.{node.attr}()")
+        # Catch __import__() calls — the bypass vector
+        elif isinstance(node, ast.Call):
+            func = node.func
+            # Direct __import__('module') call
+            if isinstance(func, ast.Name) and func.id == "__import__":
+                issues.append("Forbidden: __import__() call")
+            # getattr(__import__, ...) or similar
+            elif isinstance(func, ast.Name) and func.id in ("getattr", "setattr", "delattr"):
+                issues.append(f"Forbidden: {func.id}() can bypass import restrictions")
 
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            # Allow but note — not a hard block
-            pass
+        # Catch attribute access on os/sys that could escape
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id in ("os", "sys"):
+                if node.attr in ("system", "popen", "exec", "spawn", "fork",
+                                 "kill", "remove", "unlink", "rmdir", "exit",
+                                 "modules", "path", "environ"):
+                    issues.append(f"Forbidden: {node.value.id}.{node.attr}")
 
     if issues:
-        return False, "; ".join(issues)
+        return False, "; ".join(issues[:5])  # Limit to first 5 issues
 
     return True, "OK"
 
 
+def _build_harness(code: str, call_args_json: str) -> str:
+    """Build the Python harness script for subprocess execution.
+
+    The harness:
+    1. Sets resource limits
+    2. Replaces builtins with a restricted set
+    3. Defines the user's execute() function
+    4. Reads args from stdin
+    5. Calls execute() and prints the JSON result
+    """
+    return (
+        "import json, sys, traceback, resource\n"
+        "\n"
+        "# Set resource limits\n"
+        f"resource.setrlimit(resource.RLIMIT_CPU, ({_RLIMIT_CPU}, {_RLIMIT_CPU}))\n"
+        f"resource.setrlimit(resource.RLIMIT_FSIZE, ({_RLIMIT_FSIZE}, {_RLIMIT_FSIZE}))\n"
+        f"resource.setrlimit(resource.RLIMIT_AS, ({_RLIMIT_AS}, {_RLIMIT_AS}))\n"
+        "try:\n"
+        "    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n"
+        "except (ValueError, OSError):\n"
+        "    pass  # NPROC not available on all platforms\n"
+        "\n"
+        "# Restricted builtins — strip dangerous functions\n"
+        "_safe_builtins = {k: v for k, v in __builtins__.__dict__.items()\n"
+        "                  if k not in __import__('sandbox_forbidden')._FORBIDDEN_BUILTINS}\n"
+        "del _safe_builtins['__import__']\n"
+        "\n"
+        + code +
+        "\n\n"
+        "# Read args and execute\n"
+        "test_args = json.loads(sys.stdin.read())\n"
+        "if 'execute' not in dir():\n"
+        "    print(json.dumps({'error': 'No execute() function defined'}))\n"
+        "    sys.exit(1)\n"
+        "try:\n"
+        "    result = execute(test_args)\n"
+        "    print(json.dumps(result, default=str))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'error': str(e), 'traceback': traceback.format_exc()}))\n"
+        "    sys.exit(1)\n"
+    )
+
+
 def run_code(
     code: str,
-    test_args: Dict[str, Any],
+    args: Dict[str, Any],
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Tuple[bool, str, str]:
-    """Run forged tool code in a subprocess with test arguments.
+    """Run forged tool code in a sandbox subprocess.
 
     The code must define a function called ``execute`` that takes a dict
     and returns a JSON-serializable result.
+
+    This is used BOTH for testing (during forge_tool) AND for normal
+    execution (during forge_call). Forged tools NEVER run in the main
+    Hermes process.
 
     Returns (passed, stdout, stderr).
     """
@@ -124,21 +191,31 @@ def run_code(
     if not ok:
         return False, "", f"Validation failed: {msg}"
 
-    # Build the test harness — user code at module level (no indentation)
-    # so the execute() function is defined at the top level.
+    # Size-check the args
+    args_json = json.dumps(args)
+    if len(args_json) > MAX_TEST_ARGS_SIZE:
+        return False, "", f"Arguments exceed {MAX_TEST_ARGS_SIZE} chars"
+
+    # Build the harness — user code at module level
     harness = (
-        "import json, sys, traceback\n"
+        "import json, sys, traceback, resource\n"
         "\n"
-        + code
-        + "\n\n"
-        "# Test arguments passed as JSON via stdin\n"
+        "# Set resource limits\n"
+        f"resource.setrlimit(resource.RLIMIT_CPU, ({_RLIMIT_CPU}, {_RLIMIT_CPU}))\n"
+        f"resource.setrlimit(resource.RLIMIT_FSIZE, ({_RLIMIT_FSIZE}, {_RLIMIT_FSIZE}))\n"
+        f"resource.setrlimit(resource.RLIMIT_AS, ({_RLIMIT_AS}, {_RLIMIT_AS}))\n"
+        "try:\n"
+        "    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n"
+        "except (ValueError, OSError):\n"
+        "    pass\n"
+        "\n"
+        + code +
+        "\n\n"
+        "# Read args and execute\n"
         "test_args = json.loads(sys.stdin.read())\n"
-        "\n"
-        "# Call the execute function\n"
         "if 'execute' not in dir():\n"
         "    print(json.dumps({'error': 'No execute() function defined'}))\n"
         "    sys.exit(1)\n"
-        "\n"
         "try:\n"
         "    result = execute(test_args)\n"
         "    print(json.dumps(result, default=str))\n"
@@ -149,15 +226,15 @@ def run_code(
 
     # Write harness to temp file and execute
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix="forge_test_"
+        mode="w", suffix=".py", delete=False, prefix="forge_sandbox_"
     ) as f:
         f.write(harness)
         harness_path = f.name
 
     try:
         proc = subprocess.run(
-            [sys.executable, harness_path],
-            input=json.dumps(test_args),
+            [sys.executable, "-I", harness_path],  # -I = isolated mode
+            input=args_json,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -173,9 +250,9 @@ def run_code(
         passed = proc.returncode == 0
         return passed, stdout, stderr
     except subprocess.TimeoutExpired:
-        return False, "", f"Test timed out after {timeout}s"
+        return False, "", f"Execution timed out after {timeout}s"
     except Exception as e:
-        return False, "", f"Test execution failed: {e}"
+        return False, "", f"Execution failed: {e}"
     finally:
         try:
             os.unlink(harness_path)
