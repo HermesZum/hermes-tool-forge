@@ -1,7 +1,7 @@
 name: tool_forge
 version: 1.0.0
 description: "Runtime tool forging — agents write, judge-test, and register their own tools mid-conversation."
-author: HermesZum
+author: hermes-agent-contrib
 license: MIT
 kind: standalone
 provides_tools:
